@@ -363,6 +363,9 @@ void destroy_dlg(struct dlg_cell *dlg)
 
 	run_dlg_callbacks(DLGCB_DESTROY, dlg, NULL, NULL, DLG_DIR_NONE, 0);
 
+	if(dlg_enable_dmq)
+		dlg_dmq_replica_unmap(dlg);
+
 	if(dlg_enable_dmq && (dlg->iflags & DLG_IFLAG_DMQ_SYNC))
 		dlg_dmq_replicate_action(DLG_DMQ_RM, dlg, 0, 0);
 
@@ -405,7 +408,6 @@ void destroy_dlg(struct dlg_cell *dlg)
 
 	if(dlg->toroute_name.s)
 		shm_free(dlg->toroute_name.s);
-
 
 	while(dlg->vars) {
 		var = dlg->vars;

@@ -41,9 +41,13 @@ typedef enum
 	DLG_DMQ_STATE,
 	DLG_DMQ_RM,
 	DLG_DMQ_SYNC,
+	DLG_DMQ_PING,
 } dlg_dmq_action_t;
 
 int dlg_dmq_initialize();
+void dlg_dmq_replica_unmap(dlg_cell_t *dlg);
+void dlg_dmq_peer_liveness_init(void);
+void dlg_dmq_peer_liveness_timer_exec(unsigned int ticks, void *param);
 int dlg_dmq_handle_msg(
 		struct sip_msg *msg, peer_reponse_t *resp, dmq_node_t *node);
 int dlg_dmq_replicate_action(dlg_dmq_action_t action, dlg_cell_t *dlg,

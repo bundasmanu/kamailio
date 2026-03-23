@@ -1463,6 +1463,83 @@ modparam("dialog", "enable_dmq", 1)
 	</example>
     </section>
 
+	<section id="dialog.p.dmq_peer_liveness_enable">
+		<title><varname>dmq_peer_liveness_enable</varname> (integer)</title>
+		<para>
+			Master switch for DMQ peer liveness on replicas. When set to
+			<quote>1</quote>, a timer process periodically sends a lightweight
+			<literal>DLG_DMQ_PING</literal> to each remote node in the DMQ
+			cluster node list (same membership rules as DMQ message fan-out:
+			non-local, <literal>DMQ_NODE_ACTIVE</literal>). Replica ownership
+			for purge decisions is tracked separately in shared memory (see
+			<varname>dmq_peer_liveness_interval</varname>). Requires
+			<varname>enable_dmq</varname>. The replica-to-peer association is kept
+			only in shared memory for this feature; it is not part of the dialog
+			database schema.
+		</para>
+		<para>
+		<emphasis>
+			Default value is <quote>0</quote> (disabled).
+		</emphasis>
+		</para>
+		<example>
+		<title>Enable DMQ peer liveness</title>
+		<programlisting format="linespecific">
+...
+modparam("dialog", "dmq_peer_liveness_enable", 1)
+...
+</programlisting>
+		</example>
+	</section>
+
+	<section id="dialog.p.dmq_peer_liveness_interval">
+		<title><varname>dmq_peer_liveness_interval</varname> (integer)</title>
+		<para>
+			Seconds between liveness rounds (one ping per eligible cluster node
+			from the <literal>dmq</literal> module node list). If less than
+			<quote>1</quote> when
+			<varname>dmq_peer_liveness_enable</varname> is set, the value is
+			reset to <quote>300</quote> at startup.
+		</para>
+		<para>
+		<emphasis>
+			Default value is <quote>300</quote>.
+		</emphasis>
+		</para>
+		<example>
+		<title>Set liveness interval to 5 minutes</title>
+		<programlisting format="linespecific">
+...
+modparam("dialog", "dmq_peer_liveness_interval", 300)
+...
+</programlisting>
+		</example>
+	</section>
+
+	<section id="dialog.p.dmq_peer_liveness_failures">
+		<title><varname>dmq_peer_liveness_failures</varname> (integer)</title>
+		<para>
+			Consecutive failed pings (non-200 response, transaction error, or
+			peer not present in the local DMQ node list) before all dialog
+			replicas attributed to that peer are removed from memory on this
+			instance. A successful ping resets the counter for that peer.
+		</para>
+		<para>
+		<emphasis>
+			Default value is <quote>3</quote>. Values below <quote>1</quote>
+			are corrected to <quote>3</quote> at startup.
+		</emphasis>
+		</para>
+		<example>
+		<title>Require five failures before purge</title>
+		<programlisting format="linespecific">
+...
+modparam("dialog", "dmq_peer_liveness_failures", 5)
+...
+</programlisting>
+		</example>
+	</section>
+
 	<section id="dialog.p.track_cseq_updates">
 		<title><varname>track_cseq_updates</varname> (int)</title>
 		<para>

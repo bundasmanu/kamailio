@@ -21,9 +21,16 @@
 *
 */
 
+#include <string.h>
+#include <time.h>
+
+#include "../../core/mem/shm_mem.h"
+#include "../dmq/dmq_funcs.h"
+#include "../dmq/dmqnode.h"
 #include "dlg_dmq.h"
 #include "dlg_hash.h"
 #include "dlg_profile.h"
+#include "dlg_timer.h"
 #include "dlg_var.h"
 
 static str dlg_dmq_content_type = str_init("application/json");
@@ -38,6 +45,65 @@ int dmq_send_all_dlgs(dmq_node_t *dmq_node);
 int dlg_dmq_request_sync();
 
 extern int dlg_enable_stats;
+extern int dlg_dmq_peer_liveness_enable;
+extern int dlg_dmq_peer_liveness_interval;
+extern int dlg_dmq_peer_liveness_failures;
+
+typedef struct dlg_dmq_ping_cb_param
+{
+	str uri;
+} dlg_dmq_ping_cb_param_t;
+
+/*!
+ * One row in the peer-liveness hash: which DMQ node URI created this replica
+ * (dlg_iuid). The trailing _t marks a typedef name (same convention as
+ * dlg_cell_t, size_t, etc.).
+ */
+typedef struct dlg_dmq_replica_owner
+{
+	dlg_iuid_t iuid;
+	unsigned int owner_uri_len;
+	struct dlg_dmq_replica_owner *next;
+	char owner_uri[1];
+} dlg_dmq_replica_owner_t;
+
+typedef struct dlg_dmq_purge_q
+{
+	dlg_iuid_t iuid;
+	struct dlg_dmq_purge_q *next;
+} dlg_dmq_purge_q_t;
+
+typedef struct dlg_uri_fail
+{
+	int failures;
+	struct dlg_uri_fail *next;
+	unsigned int ulen;
+	char ustr[1];
+} dlg_uri_fail_t;
+
+#define DLG_DMQ_REPLICA_OWNER_BUCKETS 512
+#define DLG_DMQ_URI_FAIL_BUCKETS 64
+
+static gen_lock_t *dlg_dmq_live_lock = NULL;
+static dlg_dmq_replica_owner_t
+		*dlg_dmq_replica_owner_ht[DLG_DMQ_REPLICA_OWNER_BUCKETS];
+static dlg_uri_fail_t *dlg_uri_fail_buckets[DLG_DMQ_URI_FAIL_BUCKETS];
+
+static int dlg_dmq_ping_resp_f(
+		struct sip_msg *msg, int code, dmq_node_t *node, void *param);
+static unsigned int dlg_dmq_uri_hash(str *u);
+static dlg_uri_fail_t *dlg_uri_fail_find_nolock(str *u);
+static dlg_uri_fail_t *dlg_uri_fail_get_or_create_nolock(str *u);
+static void dlg_uri_fail_unlink_nolock(str *u);
+static int dlg_dmq_replica_owner_uri_match(dlg_dmq_replica_owner_t *r, str *o);
+static void dlg_dmq_replica_register(dlg_cell_t *dlg, dmq_node_t *node);
+static int dlg_dmq_replica_rm_unrefs(dlg_cell_t *dlg);
+static void dlg_dmq_collect_purge_by_owner_nolock(
+		str *owner, dlg_dmq_purge_q_t **pkg_head);
+static void dlg_dmq_exec_purge_queue(dlg_dmq_purge_q_t *pkg_head);
+static void dlg_dmq_peer_fail(str *u);
+static void dlg_dmq_peer_ok(str *u);
+static int dlg_dmq_send_ping(str *uri);
 
 /**
 * @brief add notification peer
@@ -67,6 +133,7 @@ int dlg_dmq_initialize()
 	} else {
 		LM_DBG("dmq peer registered\n");
 	}
+	dlg_dmq_peer_liveness_init();
 	return 0;
 error:
 	return -1;
@@ -89,6 +156,431 @@ int dlg_dmq_send(str *body, dmq_node_t *node)
 				dlg_dmq_peer, body, 0, NULL, 1, &dlg_dmq_content_type);
 	}
 	return 0;
+}
+
+
+static unsigned int dlg_dmq_uri_hash(str *u)
+{
+	unsigned int i, h = 5381;
+
+	for(i = 0; i < (unsigned int)u->len; i++)
+		h = ((h << 5) + h) + (unsigned char)u->s[i];
+	return h;
+}
+
+#define URI_FAIL_BUCKET(u) (dlg_dmq_uri_hash(u) % DLG_DMQ_URI_FAIL_BUCKETS)
+
+static dlg_uri_fail_t *dlg_uri_fail_find_nolock(str *u)
+{
+	dlg_uri_fail_t *f;
+	unsigned int b;
+
+	b = URI_FAIL_BUCKET(u);
+	for(f = dlg_uri_fail_buckets[b]; f; f = f->next) {
+		if(f->ulen == (unsigned int)u->len
+				&& memcmp(f->ustr, u->s, u->len) == 0)
+			return f;
+	}
+	return NULL;
+}
+
+static dlg_uri_fail_t *dlg_uri_fail_get_or_create_nolock(str *u)
+{
+	dlg_uri_fail_t *f;
+	int sz;
+	unsigned int b;
+
+	f = dlg_uri_fail_find_nolock(u);
+	if(f)
+		return f;
+	sz = (int)(sizeof(dlg_uri_fail_t) - 1 + u->len);
+	f = (dlg_uri_fail_t *)shm_malloc(sz);
+	if(f == NULL)
+		return NULL;
+	memset(f, 0, sz);
+	f->ulen = (unsigned int)u->len;
+	memcpy(f->ustr, u->s, u->len);
+	b = URI_FAIL_BUCKET(u);
+	f->next = dlg_uri_fail_buckets[b];
+	dlg_uri_fail_buckets[b] = f;
+	return f;
+}
+
+static void dlg_uri_fail_unlink_nolock(str *u)
+{
+	dlg_uri_fail_t *f, **pf;
+	unsigned int b;
+
+	b = URI_FAIL_BUCKET(u);
+	pf = &dlg_uri_fail_buckets[b];
+	while((f = *pf) != NULL) {
+		if(f->ulen == (unsigned int)u->len
+				&& memcmp(f->ustr, u->s, u->len) == 0) {
+			*pf = f->next;
+			shm_free(f);
+			return;
+		}
+		pf = &f->next;
+	}
+}
+
+static int dlg_dmq_replica_owner_uri_match(dlg_dmq_replica_owner_t *r, str *o)
+{
+	return r->owner_uri_len == (unsigned int)o->len
+		   && memcmp(r->owner_uri, o->s, o->len) == 0;
+}
+
+static unsigned int dlg_dmq_replica_owner_bidx(dlg_iuid_t *iuid)
+{
+	unsigned int x;
+
+	x = iuid->h_entry ^ (iuid->h_id * 2654435761U);
+	return x & (DLG_DMQ_REPLICA_OWNER_BUCKETS - 1);
+}
+
+static dlg_dmq_replica_owner_t *dlg_dmq_replica_owner_find_nolock(dlg_iuid_t *iuid)
+{
+	dlg_dmq_replica_owner_t *r;
+	unsigned int b;
+
+	b = dlg_dmq_replica_owner_bidx(iuid);
+	for(r = dlg_dmq_replica_owner_ht[b]; r; r = r->next) {
+		if(r->iuid.h_id == iuid->h_id && r->iuid.h_entry == iuid->h_entry)
+			return r;
+	}
+	return NULL;
+}
+
+static void dlg_dmq_replica_register(dlg_cell_t *dlg, dmq_node_t *node)
+{
+	dlg_dmq_replica_owner_t *roe;
+	dlg_iuid_t iuid;
+	unsigned int b;
+	int rsz;
+
+	if(dlg_dmq_peer_liveness_enable == 0 || dlg_dmq_live_lock == NULL)
+		return;
+	if(node == NULL || node->orig_uri.s == NULL || node->orig_uri.len <= 0)
+		return;
+	if((dlg->iflags & DLG_IFLAG_DMQ_REPLICA) == 0)
+		return;
+
+	iuid.h_id = dlg->h_id;
+	iuid.h_entry = dlg->h_entry;
+
+	lock_get(dlg_dmq_live_lock);
+	if(dlg_dmq_replica_owner_find_nolock(&iuid) != NULL) {
+		lock_release(dlg_dmq_live_lock);
+		return;
+	}
+	rsz = (int)(sizeof(dlg_dmq_replica_owner_t) - 1 + node->orig_uri.len);
+	roe = (dlg_dmq_replica_owner_t *)shm_malloc(rsz);
+	if(roe == NULL) {
+		lock_release(dlg_dmq_live_lock);
+		return;
+	}
+	memset(roe, 0, rsz);
+	roe->iuid = iuid;
+	roe->owner_uri_len = (unsigned int)node->orig_uri.len;
+	memcpy(roe->owner_uri, node->orig_uri.s, node->orig_uri.len);
+	b = dlg_dmq_replica_owner_bidx(&iuid);
+	roe->next = dlg_dmq_replica_owner_ht[b];
+	dlg_dmq_replica_owner_ht[b] = roe;
+	lock_release(dlg_dmq_live_lock);
+}
+
+void dlg_dmq_replica_unmap(dlg_cell_t *dlg)
+{
+	dlg_iuid_t iuid;
+	dlg_dmq_replica_owner_t *r, **pr;
+	unsigned int b;
+
+	if(dlg_dmq_peer_liveness_enable == 0 || dlg_dmq_live_lock == NULL)
+		return;
+
+	iuid.h_id = dlg->h_id;
+	iuid.h_entry = dlg->h_entry;
+
+	lock_get(dlg_dmq_live_lock);
+	b = dlg_dmq_replica_owner_bidx(&iuid);
+	pr = &dlg_dmq_replica_owner_ht[b];
+	while((r = *pr) != NULL) {
+		if(r->iuid.h_id == iuid.h_id && r->iuid.h_entry == iuid.h_entry) {
+			*pr = r->next;
+			shm_free(r);
+			break;
+		}
+		pr = &r->next;
+	}
+	lock_release(dlg_dmq_live_lock);
+}
+
+static int dlg_dmq_replica_rm_unrefs(dlg_cell_t *dlg)
+{
+	int ret;
+	int unref = 0;
+
+	if(dlg->state == DLG_STATE_CONFIRMED || dlg->state == DLG_STATE_EARLY) {
+		ret = remove_dialog_timer(&dlg->tl);
+		if(ret == 0)
+			unref++;
+		else if(ret < 0)
+			LM_CRIT("replica rm: unable to unlink timer dlg %p\n", dlg);
+	}
+	if(dlg->state == DLG_STATE_CONFIRMED_NA
+			|| dlg->state == DLG_STATE_CONFIRMED) {
+		if_update_stat(dlg_enable_stats, active_dlgs, -1);
+	} else if(dlg->state == DLG_STATE_EARLY) {
+		if_update_stat(dlg_enable_stats, early_dlgs, -1);
+	}
+	dlg->dflags |= DLG_FLAG_NEW;
+	dlg->iflags &= ~(DLG_IFLAG_DMQ_SYNC | DLG_IFLAG_DMQ_REPLICA);
+	unref++;
+	return unref;
+}
+
+static void dlg_dmq_collect_purge_by_owner_nolock(
+		str *owner, dlg_dmq_purge_q_t **pkg_head)
+{
+	dlg_dmq_replica_owner_t *r, **pr;
+	dlg_dmq_purge_q_t *q;
+	unsigned int i;
+
+	for(i = 0; i < DLG_DMQ_REPLICA_OWNER_BUCKETS; i++) {
+		pr = &dlg_dmq_replica_owner_ht[i];
+		while((r = *pr) != NULL) {
+			if(dlg_dmq_replica_owner_uri_match(r, owner)) {
+				*pr = r->next;
+				q = (dlg_dmq_purge_q_t *)pkg_malloc(sizeof(*q));
+				if(q) {
+					q->iuid = r->iuid;
+					q->next = *pkg_head;
+					*pkg_head = q;
+				}
+				shm_free(r);
+				continue;
+			}
+			pr = &r->next;
+		}
+	}
+}
+
+static void dlg_dmq_exec_purge_queue(dlg_dmq_purge_q_t *pkg_head)
+{
+	dlg_dmq_purge_q_t *q, *qn;
+	int unref;
+	dlg_cell_t *dlg;
+	dlg_entry_t *d_entry;
+
+	for(q = pkg_head; q; q = qn) {
+		qn = q->next;
+		dlg = dlg_get_by_iuid(&q->iuid);
+		if(dlg == NULL) {
+			pkg_free(q);
+			continue;
+		}
+		d_entry = &d_table->entries[dlg->h_entry];
+		dlg_lock(d_table, d_entry);
+		if((dlg->iflags & DLG_IFLAG_DMQ_REPLICA) == 0) {
+			dlg_unlock(d_table, d_entry);
+			dlg_unref(dlg, 1);
+			pkg_free(q);
+			continue;
+		}
+		LM_WARN("purging replica dlg [%u:%u] after peer liveness failures "
+				"for owning DMQ node\n",
+				dlg->h_entry, dlg->h_id);
+		unref = dlg_dmq_replica_rm_unrefs(dlg);
+		dlg_unlock(d_table, d_entry);
+		dlg_unref(dlg, unref);
+		pkg_free(q);
+	}
+}
+
+static void dlg_dmq_peer_fail(str *u)
+{
+	dlg_uri_fail_t *f;
+	dlg_dmq_purge_q_t *pkg_head = NULL;
+
+	if(dlg_dmq_live_lock == NULL || u == NULL || u->len <= 0)
+		return;
+	lock_get(dlg_dmq_live_lock);
+	f = dlg_uri_fail_get_or_create_nolock(u);
+	if(f == NULL) {
+		lock_release(dlg_dmq_live_lock);
+		return;
+	}
+	f->failures++;
+	LM_NOTICE("dialog DMQ peer [%.*s] ping fail count %d\n", STR_FMT(u),
+			f->failures);
+	if(f->failures >= dlg_dmq_peer_liveness_failures) {
+		dlg_uri_fail_unlink_nolock(u);
+		dlg_dmq_collect_purge_by_owner_nolock(u, &pkg_head);
+		lock_release(dlg_dmq_live_lock);
+		dlg_dmq_exec_purge_queue(pkg_head);
+		return;
+	}
+	lock_release(dlg_dmq_live_lock);
+}
+
+static void dlg_dmq_peer_ok(str *u)
+{
+	dlg_uri_fail_t *f;
+
+	if(dlg_dmq_live_lock == NULL || u == NULL || u->len <= 0)
+		return;
+	lock_get(dlg_dmq_live_lock);
+	f = dlg_uri_fail_find_nolock(u);
+	if(f)
+		f->failures = 0;
+	lock_release(dlg_dmq_live_lock);
+}
+
+static int dlg_dmq_ping_resp_f(
+		struct sip_msg *msg, int code, dmq_node_t *node, void *param)
+{
+	dlg_dmq_ping_cb_param_t *pp = (dlg_dmq_ping_cb_param_t *)param;
+
+	(void)msg;
+	(void)node;
+	if(pp == NULL)
+		return 0;
+	if(code == 200)
+		dlg_dmq_peer_ok(&pp->uri);
+	else
+		dlg_dmq_peer_fail(&pp->uri);
+	shm_free(pp);
+	return 0;
+}
+
+static int dlg_dmq_send_ping(str *uri)
+{
+	srjson_doc_t jdoc;
+	dmq_resp_cback_t cback;
+	dmq_node_t *node;
+	dlg_dmq_ping_cb_param_t *pp;
+	int rsz;
+
+	if(dlg_dmq_peer == NULL || dlg_dmqb.send_message == NULL)
+		return -1;
+
+	memset(&jdoc, 0, sizeof(jdoc));
+	srjson_InitDoc(&jdoc, NULL);
+	jdoc.root = srjson_CreateObject(&jdoc);
+	if(jdoc.root == NULL) {
+		LM_ERR("cannot create json for DMQ ping\n");
+		return -1;
+	}
+	srjson_AddNumberToObject(&jdoc, jdoc.root, "action", DLG_DMQ_PING);
+	jdoc.buf.s = srjson_PrintUnformatted(&jdoc, jdoc.root);
+	if(jdoc.buf.s == NULL) {
+		LM_ERR("cannot serialize DMQ ping\n");
+		srjson_DestroyDoc(&jdoc);
+		return -1;
+	}
+	jdoc.buf.len = strlen(jdoc.buf.s);
+
+	node = dlg_dmqb.find_dmq_node_uri(uri);
+	if(node == NULL) {
+		LM_NOTICE("dialog DMQ peer liveness: no node for [%.*s]\n",
+				STR_FMT(uri));
+		jdoc.free_fn(jdoc.buf.s);
+		srjson_DestroyDoc(&jdoc);
+		dlg_dmq_peer_fail(uri);
+		return -1;
+	}
+
+	rsz = (int)(sizeof(dlg_dmq_ping_cb_param_t) + uri->len);
+	pp = (dlg_dmq_ping_cb_param_t *)shm_malloc(rsz);
+	if(pp == NULL) {
+		jdoc.free_fn(jdoc.buf.s);
+		srjson_DestroyDoc(&jdoc);
+		return -1;
+	}
+	memset(pp, 0, rsz);
+	pp->uri.len = uri->len;
+	pp->uri.s = (char *)pp + sizeof(dlg_dmq_ping_cb_param_t);
+	memcpy(pp->uri.s, uri->s, uri->len);
+
+	cback.f = dlg_dmq_ping_resp_f;
+	cback.param = pp;
+	if(dlg_dmqb.send_message(dlg_dmq_peer, &jdoc.buf, node, &cback, 1,
+			   &dlg_dmq_content_type)
+			< 0) {
+		shm_free(pp);
+		jdoc.free_fn(jdoc.buf.s);
+		srjson_DestroyDoc(&jdoc);
+		return -1;
+	}
+	jdoc.free_fn(jdoc.buf.s);
+	srjson_DestroyDoc(&jdoc);
+	return 0;
+}
+
+void dlg_dmq_peer_liveness_init(void)
+{
+	if(dlg_dmq_peer_liveness_enable == 0)
+		return;
+	if(dlg_dmq_live_lock != NULL)
+		return;
+	dlg_dmq_live_lock = lock_alloc();
+	if(dlg_dmq_live_lock == NULL) {
+		LM_ERR("peer liveness lock alloc failed\n");
+		return;
+	}
+	if(lock_init(dlg_dmq_live_lock) == 0) {
+		LM_ERR("peer liveness lock init failed\n");
+		lock_dealloc(dlg_dmq_live_lock);
+		dlg_dmq_live_lock = NULL;
+		return;
+	}
+	LM_INFO("dialog DMQ peer liveness: interval=%ds failures_before_purge=%d "
+			"(pings use dmq node list)\n",
+			dlg_dmq_peer_liveness_interval, dlg_dmq_peer_liveness_failures);
+}
+
+void dlg_dmq_peer_liveness_timer_exec(unsigned int ticks, void *param)
+{
+	typedef struct ping_uri
+	{
+		char *s;
+		int len;
+		struct ping_uri *next;
+	} ping_uri_t;
+	ping_uri_t *plist = NULL, *pu, *pun;
+	dmq_node_t *node;
+
+	(void)ticks;
+	(void)param;
+
+	if(dlg_dmq_peer_liveness_enable == 0 || dlg_dmq_peer_liveness_interval <= 0)
+		return;
+	if(dlg_dmq_live_lock == NULL || dlg_dmq_peer == NULL || dmq_node_list == NULL)
+		return;
+
+	lock_get(&dmq_node_list->lock);
+	for(node = dmq_node_list->nodes; node; node = node->next) {
+		if(node->local || node->status != DMQ_NODE_ACTIVE)
+			continue;
+		if(node->orig_uri.s == NULL || node->orig_uri.len <= 0)
+			continue;
+		pu = (ping_uri_t *)pkg_malloc(sizeof(*pu) + node->orig_uri.len);
+		if(pu == NULL)
+			continue;
+		pu->s = (char *)pu + sizeof(*pu);
+		memcpy(pu->s, node->orig_uri.s, node->orig_uri.len);
+		pu->len = node->orig_uri.len;
+		pu->next = plist;
+		plist = pu;
+	}
+	lock_release(&dmq_node_list->lock);
+
+	for(pu = plist; pu; pu = pun) {
+		str uri = {pu->s, pu->len};
+		pun = pu->next;
+		dlg_dmq_send_ping(&uri);
+		pkg_free(pu);
+	}
 }
 
 
@@ -218,6 +710,13 @@ int dlg_dmq_handle_msg(
 		}
 	}
 
+	if(action == DLG_DMQ_PING) {
+		srjson_DestroyDoc(&jdoc);
+		resp->reason = dmq_200_rpl;
+		resp->resp_code = 200;
+		return 0;
+	}
+
 	dlg = dlg_get_by_iuid_mode(&iuid, 1);
 	if(dlg) {
 		LM_DBG("found dialog [%u:%u] at %p\n", iuid.h_entry, iuid.h_id, dlg);
@@ -252,7 +751,8 @@ int dlg_dmq_handle_msg(
 				dlg->h_id = iuid.h_id;
 				/* prevent DB sync */
 				dlg->dflags &= ~(DLG_FLAG_NEW | DLG_FLAG_CHANGED);
-				dlg->iflags |= DLG_IFLAG_DMQ_SYNC;
+				dlg->iflags |= DLG_IFLAG_DMQ_SYNC | DLG_IFLAG_DMQ_REPLICA;
+				dlg_dmq_replica_register(dlg, node);
 				newdlg = 1;
 			} else {
 				/* remove existing profiles */
@@ -371,6 +871,7 @@ int dlg_dmq_handle_msg(
 				LM_DBG("dialog [%u:%u] not found\n", iuid.h_entry, iuid.h_id);
 				goto error;
 			}
+			dlg_dmq_replica_unmap(dlg);
 			LM_DBG("Removed dlg [%u:%u] with callid [%.*s] int state [%u]\n",
 					iuid.h_entry, iuid.h_id, dlg->callid.len, dlg->callid.s,
 					dlg->state);
@@ -393,7 +894,7 @@ int dlg_dmq_handle_msg(
 			}
 			/* prevent DB sync */
 			dlg->dflags |= DLG_FLAG_NEW;
-			dlg->iflags &= ~DLG_IFLAG_DMQ_SYNC;
+			dlg->iflags &= ~(DLG_IFLAG_DMQ_SYNC | DLG_IFLAG_DMQ_REPLICA);
 			unref++;
 			break;
 
@@ -402,6 +903,7 @@ int dlg_dmq_handle_msg(
 			break;
 
 		case DLG_DMQ_NONE:
+		case DLG_DMQ_PING:
 			break;
 	}
 	if(dlg) {
@@ -624,11 +1126,12 @@ int dlg_dmq_replicate_action(dlg_dmq_action_t action, dlg_cell_t *dlg,
 
 		case DLG_DMQ_RM:
 			srjson_AddNumberToObject(&jdoc, jdoc.root, "state", dlg->state);
-			dlg->iflags &= ~DLG_IFLAG_DMQ_SYNC;
+			dlg->iflags &= ~(DLG_IFLAG_DMQ_SYNC | DLG_IFLAG_DMQ_REPLICA);
 			break;
 
 		case DLG_DMQ_NONE:
 		case DLG_DMQ_SYNC:
+		case DLG_DMQ_PING:
 			break;
 	}
 	if(needlock)

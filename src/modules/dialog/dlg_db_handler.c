@@ -481,6 +481,7 @@ int load_dialog_info_from_db(
 				srjson_DestroyDoc(&jdoc);
 			}
 			dlg->iflags = (unsigned int)VAL_INT(values + 22);
+			dlg->iflags &= ~DLG_IFLAG_DMQ_REPLICA;
 			if(dlg->state == DLG_STATE_CONFIRMED)
 				dlg_ka_add(dlg);
 
