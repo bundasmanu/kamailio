@@ -24,7 +24,9 @@
 #include <string.h>
 #include <time.h>
 
+#include "../../core/mem/mem.h"
 #include "../../core/mem/shm_mem.h"
+#include "../../core/timer_proc.h"
 #include "../dmq/dmq_funcs.h"
 #include "../dmq/dmqnode.h"
 #include "dlg_dmq.h"
@@ -45,14 +47,9 @@ int dmq_send_all_dlgs(dmq_node_t *dmq_node);
 int dlg_dmq_request_sync();
 
 extern int dlg_enable_stats;
-extern int dlg_dmq_peer_liveness_enable;
-extern int dlg_dmq_peer_liveness_interval;
-extern int dlg_dmq_peer_liveness_failures;
-
-typedef struct dlg_dmq_ping_cb_param
-{
-	str uri;
-} dlg_dmq_ping_cb_param_t;
+extern int dlg_enable_dmq;
+extern int remove_dialogs_on_failed_peer;
+extern int remove_dialogs_failed_peer_timeout;
 
 /*!
  * One row in the peer-liveness hash: which DMQ node URI created this replica
@@ -75,7 +72,7 @@ typedef struct dlg_dmq_purge_q
 
 typedef struct dlg_uri_fail
 {
-	int failures;
+	time_t first_fail;
 	struct dlg_uri_fail *next;
 	unsigned int ulen;
 	char ustr[1];
@@ -89,8 +86,6 @@ static dlg_dmq_replica_owner_t
 		*dlg_dmq_replica_owner_ht[DLG_DMQ_REPLICA_OWNER_BUCKETS];
 static dlg_uri_fail_t *dlg_uri_fail_buckets[DLG_DMQ_URI_FAIL_BUCKETS];
 
-static int dlg_dmq_ping_resp_f(
-		struct sip_msg *msg, int code, dmq_node_t *node, void *param);
 static unsigned int dlg_dmq_uri_hash(str *u);
 static dlg_uri_fail_t *dlg_uri_fail_find_nolock(str *u);
 static dlg_uri_fail_t *dlg_uri_fail_get_or_create_nolock(str *u);
@@ -103,7 +98,9 @@ static void dlg_dmq_collect_purge_by_owner_nolock(
 static void dlg_dmq_exec_purge_queue(dlg_dmq_purge_q_t *pkg_head);
 static void dlg_dmq_peer_fail(str *u);
 static void dlg_dmq_peer_ok(str *u);
-static int dlg_dmq_send_ping(str *uri);
+static int dlg_dmq_failed_peer_poll_interval(void);
+static void dlg_dmq_failed_peer_timer_exec(unsigned int ticks, void *param);
+static void dlg_dmq_failed_peer_track_init(void);
 
 /**
 * @brief add notification peer
@@ -133,7 +130,7 @@ int dlg_dmq_initialize()
 	} else {
 		LM_DBG("dmq peer registered\n");
 	}
-	dlg_dmq_peer_liveness_init();
+	dlg_dmq_failed_peer_track_init();
 	return 0;
 error:
 	return -1;
@@ -259,7 +256,7 @@ static void dlg_dmq_replica_register(dlg_cell_t *dlg, dmq_node_t *node)
 	unsigned int b;
 	int rsz;
 
-	if(dlg_dmq_peer_liveness_enable == 0 || dlg_dmq_live_lock == NULL)
+	if(remove_dialogs_on_failed_peer == 0 || dlg_dmq_live_lock == NULL)
 		return;
 	if(node == NULL || node->orig_uri.s == NULL || node->orig_uri.len <= 0)
 		return;
@@ -296,7 +293,7 @@ void dlg_dmq_replica_unmap(dlg_cell_t *dlg)
 	dlg_dmq_replica_owner_t *r, **pr;
 	unsigned int b;
 
-	if(dlg_dmq_peer_liveness_enable == 0 || dlg_dmq_live_lock == NULL)
+	if(remove_dialogs_on_failed_peer == 0 || dlg_dmq_live_lock == NULL)
 		return;
 
 	iuid.h_id = dlg->h_id;
@@ -388,7 +385,7 @@ static void dlg_dmq_exec_purge_queue(dlg_dmq_purge_q_t *pkg_head)
 			pkg_free(q);
 			continue;
 		}
-		LM_WARN("purging replica dlg [%u:%u] after peer liveness failures "
+		LM_WARN("purging replica dlg [%u:%u] after failed-peer timeout "
 				"for owning DMQ node\n",
 				dlg->h_entry, dlg->h_id);
 		unref = dlg_dmq_replica_rm_unrefs(dlg);
@@ -402,25 +399,37 @@ static void dlg_dmq_peer_fail(str *u)
 {
 	dlg_uri_fail_t *f;
 	dlg_dmq_purge_q_t *pkg_head = NULL;
+	time_t now;
+	int tmo;
 
 	if(dlg_dmq_live_lock == NULL || u == NULL || u->len <= 0)
 		return;
+	tmo = remove_dialogs_failed_peer_timeout;
+	if(tmo < 1)
+		tmo = 300;
 	lock_get(dlg_dmq_live_lock);
 	f = dlg_uri_fail_get_or_create_nolock(u);
 	if(f == NULL) {
 		lock_release(dlg_dmq_live_lock);
 		return;
 	}
-	f->failures++;
-	LM_NOTICE("dialog DMQ peer [%.*s] ping fail count %d\n", STR_FMT(u),
-			f->failures);
-	if(f->failures >= dlg_dmq_peer_liveness_failures) {
+	now = time(NULL);
+	if(f->first_fail == 0) {
+		f->first_fail = now;
+		LM_DBG("dialog DMQ peer [%.*s] first failure (per DMQ node state)\n",
+				STR_FMT(u));
+		lock_release(dlg_dmq_live_lock);
+		return;
+	}
+	if((now - f->first_fail) >= (time_t)tmo) {
 		dlg_uri_fail_unlink_nolock(u);
 		dlg_dmq_collect_purge_by_owner_nolock(u, &pkg_head);
 		lock_release(dlg_dmq_live_lock);
 		dlg_dmq_exec_purge_queue(pkg_head);
 		return;
 	}
+	LM_DBG("dialog DMQ peer [%.*s] still down, elapsed %lds/%ds\n", STR_FMT(u),
+			(long)(now - f->first_fail), tmo);
 	lock_release(dlg_dmq_live_lock);
 }
 
@@ -433,94 +442,28 @@ static void dlg_dmq_peer_ok(str *u)
 	lock_get(dlg_dmq_live_lock);
 	f = dlg_uri_fail_find_nolock(u);
 	if(f)
-		f->failures = 0;
+		f->first_fail = 0;
 	lock_release(dlg_dmq_live_lock);
 }
 
-static int dlg_dmq_ping_resp_f(
-		struct sip_msg *msg, int code, dmq_node_t *node, void *param)
+static int dlg_dmq_failed_peer_poll_interval(void)
 {
-	dlg_dmq_ping_cb_param_t *pp = (dlg_dmq_ping_cb_param_t *)param;
+	int t, iv;
 
-	(void)msg;
-	(void)node;
-	if(pp == NULL)
-		return 0;
-	if(code == 200)
-		dlg_dmq_peer_ok(&pp->uri);
-	else
-		dlg_dmq_peer_fail(&pp->uri);
-	shm_free(pp);
-	return 0;
+	t = remove_dialogs_failed_peer_timeout;
+	if(t < 1)
+		t = 300;
+	iv = t / 10;
+	if(iv < 1)
+		iv = 1;
+	if(iv > 60)
+		iv = 60;
+	return iv;
 }
 
-static int dlg_dmq_send_ping(str *uri)
+static void dlg_dmq_failed_peer_track_init(void)
 {
-	srjson_doc_t jdoc;
-	dmq_resp_cback_t cback;
-	dmq_node_t *node;
-	dlg_dmq_ping_cb_param_t *pp;
-	int rsz;
-
-	if(dlg_dmq_peer == NULL || dlg_dmqb.send_message == NULL)
-		return -1;
-
-	memset(&jdoc, 0, sizeof(jdoc));
-	srjson_InitDoc(&jdoc, NULL);
-	jdoc.root = srjson_CreateObject(&jdoc);
-	if(jdoc.root == NULL) {
-		LM_ERR("cannot create json for DMQ ping\n");
-		return -1;
-	}
-	srjson_AddNumberToObject(&jdoc, jdoc.root, "action", DLG_DMQ_PING);
-	jdoc.buf.s = srjson_PrintUnformatted(&jdoc, jdoc.root);
-	if(jdoc.buf.s == NULL) {
-		LM_ERR("cannot serialize DMQ ping\n");
-		srjson_DestroyDoc(&jdoc);
-		return -1;
-	}
-	jdoc.buf.len = strlen(jdoc.buf.s);
-
-	node = dlg_dmqb.find_dmq_node_uri(uri);
-	if(node == NULL) {
-		LM_NOTICE(
-				"dialog DMQ peer liveness: no node for [%.*s]\n", STR_FMT(uri));
-		jdoc.free_fn(jdoc.buf.s);
-		srjson_DestroyDoc(&jdoc);
-		dlg_dmq_peer_fail(uri);
-		return -1;
-	}
-
-	rsz = (int)(sizeof(dlg_dmq_ping_cb_param_t) + uri->len);
-	pp = (dlg_dmq_ping_cb_param_t *)shm_malloc(rsz);
-	if(pp == NULL) {
-		jdoc.free_fn(jdoc.buf.s);
-		srjson_DestroyDoc(&jdoc);
-		return -1;
-	}
-	memset(pp, 0, rsz);
-	pp->uri.len = uri->len;
-	pp->uri.s = (char *)pp + sizeof(dlg_dmq_ping_cb_param_t);
-	memcpy(pp->uri.s, uri->s, uri->len);
-
-	cback.f = dlg_dmq_ping_resp_f;
-	cback.param = pp;
-	if(dlg_dmqb.send_message(
-			   dlg_dmq_peer, &jdoc.buf, node, &cback, 1, &dlg_dmq_content_type)
-			< 0) {
-		shm_free(pp);
-		jdoc.free_fn(jdoc.buf.s);
-		srjson_DestroyDoc(&jdoc);
-		return -1;
-	}
-	jdoc.free_fn(jdoc.buf.s);
-	srjson_DestroyDoc(&jdoc);
-	return 0;
-}
-
-void dlg_dmq_peer_liveness_init(void)
-{
-	if(dlg_dmq_peer_liveness_enable == 0)
+	if(remove_dialogs_on_failed_peer == 0)
 		return;
 	if(dlg_dmq_live_lock != NULL)
 		return;
@@ -535,54 +478,86 @@ void dlg_dmq_peer_liveness_init(void)
 		dlg_dmq_live_lock = NULL;
 		return;
 	}
-	LM_INFO("dialog DMQ peer liveness: interval=%ds failures_before_purge=%d "
-			"(pings use dmq node list)\n",
-			dlg_dmq_peer_liveness_interval, dlg_dmq_peer_liveness_failures);
+	LM_INFO("dialog DMQ failed-peer: timeout=%ds poll_interval=%ds "
+			"(uses dmq node status, no extra DMQ messages)\n",
+			remove_dialogs_failed_peer_timeout, dlg_dmq_failed_peer_poll_interval());
 }
 
-void dlg_dmq_peer_liveness_timer_exec(unsigned int ticks, void *param)
+static void dlg_dmq_failed_peer_timer_exec(unsigned int ticks, void *param)
 {
-	typedef struct ping_uri
+	typedef struct owner_uri_list
 	{
-		char *s;
-		int len;
-		struct ping_uri *next;
-	} ping_uri_t;
-	ping_uri_t *plist = NULL, *pu, *pun;
+		str u;
+		struct owner_uri_list *next;
+	} owner_uri_list_t;
+	dlg_dmq_replica_owner_t *r;
+	owner_uri_list_t *uhead = NULL, *up, *un;
 	dmq_node_t *node;
+	unsigned int bi;
+	int is_up;
 
 	(void)ticks;
 	(void)param;
 
-	if(dlg_dmq_peer_liveness_enable == 0 || dlg_dmq_peer_liveness_interval <= 0)
+	if(remove_dialogs_on_failed_peer == 0 || dlg_dmq_failed_peer_poll_interval() <= 0)
 		return;
-	if(dlg_dmq_live_lock == NULL || dlg_dmq_peer == NULL
-			|| dmq_node_list == NULL)
+	if(dlg_dmq_live_lock == NULL || dmq_node_list == NULL)
 		return;
 
-	lock_get(&dmq_node_list->lock);
-	for(node = dmq_node_list->nodes; node; node = node->next) {
-		if(node->local || node->status != DMQ_NODE_ACTIVE)
-			continue;
-		if(node->orig_uri.s == NULL || node->orig_uri.len <= 0)
-			continue;
-		pu = (ping_uri_t *)pkg_malloc(sizeof(*pu) + node->orig_uri.len);
-		if(pu == NULL)
-			continue;
-		pu->s = (char *)pu + sizeof(*pu);
-		memcpy(pu->s, node->orig_uri.s, node->orig_uri.len);
-		pu->len = node->orig_uri.len;
-		pu->next = plist;
-		plist = pu;
+	lock_get(dlg_dmq_live_lock);
+	for(bi = 0; bi < DLG_DMQ_REPLICA_OWNER_BUCKETS; bi++) {
+		for(r = dlg_dmq_replica_owner_ht[bi]; r; r = r->next) {
+			str uri = {r->owner_uri, r->owner_uri_len};
+			if(uri.len <= 0 || uri.s == NULL)
+				continue;
+			for(up = uhead; up; up = up->next) {
+				if(up->u.len == uri.len
+						&& memcmp(up->u.s, uri.s, uri.len) == 0)
+					goto next_owner;
+			}
+			up = (owner_uri_list_t *)pkg_malloc(sizeof(*up) + uri.len);
+			if(up == NULL)
+				continue;
+			up->u.s = (char *)up + sizeof(*up);
+			up->u.len = uri.len;
+			memcpy(up->u.s, uri.s, uri.len);
+			up->next = uhead;
+			uhead = up;
+		next_owner:;
+		}
 	}
-	lock_release(&dmq_node_list->lock);
+	lock_release(dlg_dmq_live_lock);
 
-	for(pu = plist; pu; pu = pun) {
-		str uri = {pu->s, pu->len};
-		pun = pu->next;
-		dlg_dmq_send_ping(&uri);
-		pkg_free(pu);
+	for(up = uhead; up; up = un) {
+		un = up->next;
+		lock_get(&dmq_node_list->lock);
+		node = find_dmq_node_uri(dmq_node_list, &up->u);
+		is_up = (node != NULL && !node->local && node->status == DMQ_NODE_ACTIVE);
+		lock_release(&dmq_node_list->lock);
+		if(is_up)
+			dlg_dmq_peer_ok(&up->u);
+		else
+			dlg_dmq_peer_fail(&up->u);
+		pkg_free(up);
 	}
+}
+
+int dlg_dmq_failed_peer_timer_start(void)
+{
+	int iv;
+
+	if(dlg_enable_dmq <= 0 || remove_dialogs_on_failed_peer <= 0)
+		return 0;
+	iv = dlg_dmq_failed_peer_poll_interval();
+	if(iv <= 0)
+		return 0;
+	if(fork_sync_timer(PROC_TIMER, "Dialog DMQ failed-peer liveness",
+			   1 /*socks flag*/, dlg_dmq_failed_peer_timer_exec, NULL, iv /*sec*/)
+			< 0) {
+		LM_ERR("failed to start DMQ failed-peer liveness timer\n");
+		return -1;
+	}
+	return 0;
 }
 
 

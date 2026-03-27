@@ -117,9 +117,8 @@ int dlg_noack_timeout = 60;
 int dlg_end_timeout = 300;
 
 int dlg_enable_dmq = 0;
-int dlg_dmq_peer_liveness_enable = 0;
-int dlg_dmq_peer_liveness_interval = 300;
-int dlg_dmq_peer_liveness_failures = 3;
+int remove_dialogs_on_failed_peer = 0;
+int remove_dialogs_failed_peer_timeout = 300;
 
 int dlg_event_rt[DLG_EVENTRT_MAX];
 str dlg_event_callback = STR_NULL;
@@ -378,9 +377,9 @@ static param_export_t mod_params[]={
 	{ "db_skip_load",          PARAM_INT, &db_skip_load             },
 	{ "ka_failed_limit",       PARAM_INT, &dlg_ka_failed_limit      },
 	{ "enable_dmq",            PARAM_INT, &dlg_enable_dmq           },
-	{ "dmq_peer_liveness_enable", PARAM_INT, &dlg_dmq_peer_liveness_enable },
-	{ "dmq_peer_liveness_interval", PARAM_INT, &dlg_dmq_peer_liveness_interval },
-	{ "dmq_peer_liveness_failures", PARAM_INT, &dlg_dmq_peer_liveness_failures },
+	{ "remove_dialogs_on_failed_peer", PARAM_INT, &remove_dialogs_on_failed_peer },
+	{ "remove_dialogs_failed_peer_timeout", PARAM_INT,
+			&remove_dialogs_failed_peer_timeout },
 	{ "event_callback",        PARAM_STR, &dlg_event_callback       },
 	{ "early_timeout",         PARAM_INT, &dlg_early_timeout        },
 	{ "noack_timeout",         PARAM_INT, &dlg_noack_timeout        },
@@ -806,14 +805,10 @@ static int mod_init(void)
 		LM_ERR("failed to initialize dmq integration\n");
 		return -1;
 	}
-	if(dlg_enable_dmq > 0 && dlg_dmq_peer_liveness_enable > 0) {
-		if(dlg_dmq_peer_liveness_failures < 1) {
-			LM_WARN("dmq_peer_liveness_failures < 1, using 3\n");
-			dlg_dmq_peer_liveness_failures = 3;
-		}
-		if(dlg_dmq_peer_liveness_interval < 1) {
-			LM_WARN("dmq_peer_liveness_interval < 1, using 300\n");
-			dlg_dmq_peer_liveness_interval = 300;
+	if(dlg_enable_dmq > 0 && remove_dialogs_on_failed_peer > 0) {
+		if(remove_dialogs_failed_peer_timeout < 1) {
+			LM_WARN("remove_dialogs_failed_peer_timeout < 1, using 300\n");
+			remove_dialogs_failed_peer_timeout = 300;
 		}
 	}
 
@@ -866,17 +861,8 @@ static int child_init(int rank)
 			return -1; /* error */
 		}
 
-		if(dlg_enable_dmq > 0 && dlg_dmq_peer_liveness_enable > 0
-				&& dlg_dmq_peer_liveness_interval > 0
-				&& dlg_dmq_peer_liveness_failures > 0) {
-			if(fork_sync_timer(PROC_TIMER, "Dialog DMQ peer liveness",
-					   1 /*socks flag*/, dlg_dmq_peer_liveness_timer_exec, NULL,
-					   dlg_dmq_peer_liveness_interval /*sec*/)
-					< 0) {
-				LM_ERR("failed to start DMQ peer liveness timer\n");
-				return -1;
-			}
-		}
+		if(dlg_dmq_failed_peer_timer_start() < 0)
+			return -1;
 	}
 
 	if(((dlg_db_mode == DB_MODE_REALTIME || dlg_db_mode == DB_MODE_DELAYED)
