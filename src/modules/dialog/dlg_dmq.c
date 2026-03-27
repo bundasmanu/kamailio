@@ -159,7 +159,8 @@ int dlg_dmq_send(str *body, dmq_node_t *node)
 
 static unsigned int dlg_uri_fail_bucket(str *u)
 {
-	return core_hash_idx(get_hash1_raw(u->s, (int)u->len), DLG_DMQ_URI_FAIL_BUCKETS);
+	return core_hash_idx(
+			get_hash1_raw(u->s, (int)u->len), DLG_DMQ_URI_FAIL_BUCKETS);
 }
 
 static dlg_uri_fail_t *dlg_uri_fail_find_nolock(str *u)
@@ -224,7 +225,8 @@ static int dlg_dmq_replica_owner_uri_match(dlg_dmq_replica_owner_t *r, str *o)
 
 static unsigned int dlg_dmq_replica_owner_bidx(dlg_iuid_t *iuid)
 {
-	return core_hash_idx(iuid->h_entry ^ iuid->h_id, DLG_DMQ_REPLICA_OWNER_BUCKETS);
+	return core_hash_idx(
+			iuid->h_entry ^ iuid->h_id, DLG_DMQ_REPLICA_OWNER_BUCKETS);
 }
 
 static dlg_dmq_replica_owner_t *dlg_dmq_replica_owner_find_nolock(
@@ -472,7 +474,8 @@ static void dlg_dmq_failed_peer_track_init(void)
 	}
 	LM_INFO("dialog DMQ failed-peer: timeout=%ds poll_interval=%ds "
 			"(uses dmq node status, no extra DMQ messages)\n",
-			remove_dialogs_failed_peer_timeout, dlg_dmq_failed_peer_poll_interval());
+			remove_dialogs_failed_peer_timeout,
+			dlg_dmq_failed_peer_poll_interval());
 }
 
 static void dlg_dmq_failed_peer_timer_exec(unsigned int ticks, void *param)
@@ -491,7 +494,8 @@ static void dlg_dmq_failed_peer_timer_exec(unsigned int ticks, void *param)
 	(void)ticks;
 	(void)param;
 
-	if(remove_dialogs_on_failed_peer == 0 || dlg_dmq_failed_peer_poll_interval() <= 0)
+	if(remove_dialogs_on_failed_peer == 0
+			|| dlg_dmq_failed_peer_poll_interval() <= 0)
 		return;
 	if(dlg_dmq_live_lock == NULL || dmq_node_list == NULL)
 		return;
@@ -503,8 +507,7 @@ static void dlg_dmq_failed_peer_timer_exec(unsigned int ticks, void *param)
 			if(uri.len <= 0 || uri.s == NULL)
 				continue;
 			for(up = uhead; up; up = up->next) {
-				if(up->u.len == uri.len
-						&& memcmp(up->u.s, uri.s, uri.len) == 0)
+				if(up->u.len == uri.len && memcmp(up->u.s, uri.s, uri.len) == 0)
 					goto next_owner;
 			}
 			up = (owner_uri_list_t *)pkg_malloc(sizeof(*up) + uri.len);
@@ -524,7 +527,8 @@ static void dlg_dmq_failed_peer_timer_exec(unsigned int ticks, void *param)
 		un = up->next;
 		lock_get(&dmq_node_list->lock);
 		node = find_dmq_node_uri(dmq_node_list, &up->u);
-		is_up = (node != NULL && !node->local && node->status == DMQ_NODE_ACTIVE);
+		is_up = (node != NULL && !node->local
+				 && node->status == DMQ_NODE_ACTIVE);
 		lock_release(&dmq_node_list->lock);
 		if(is_up)
 			dlg_dmq_peer_ok(&up->u);
@@ -544,7 +548,8 @@ int dlg_dmq_failed_peer_timer_start(void)
 	if(iv <= 0)
 		return 0;
 	if(fork_sync_timer(PROC_TIMER, "Dialog DMQ failed-peer liveness",
-			   1 /*socks flag*/, dlg_dmq_failed_peer_timer_exec, NULL, iv /*sec*/)
+			   1 /*socks flag*/, dlg_dmq_failed_peer_timer_exec, NULL,
+			   iv /*sec*/)
 			< 0) {
 		LM_ERR("failed to start DMQ failed-peer liveness timer\n");
 		return -1;
