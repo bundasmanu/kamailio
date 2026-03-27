@@ -238,7 +238,8 @@ static unsigned int dlg_dmq_replica_owner_bidx(dlg_iuid_t *iuid)
 	return x & (DLG_DMQ_REPLICA_OWNER_BUCKETS - 1);
 }
 
-static dlg_dmq_replica_owner_t *dlg_dmq_replica_owner_find_nolock(dlg_iuid_t *iuid)
+static dlg_dmq_replica_owner_t *dlg_dmq_replica_owner_find_nolock(
+		dlg_iuid_t *iuid)
 {
 	dlg_dmq_replica_owner_t *r;
 	unsigned int b;
@@ -482,8 +483,8 @@ static int dlg_dmq_send_ping(str *uri)
 
 	node = dlg_dmqb.find_dmq_node_uri(uri);
 	if(node == NULL) {
-		LM_NOTICE("dialog DMQ peer liveness: no node for [%.*s]\n",
-				STR_FMT(uri));
+		LM_NOTICE(
+				"dialog DMQ peer liveness: no node for [%.*s]\n", STR_FMT(uri));
 		jdoc.free_fn(jdoc.buf.s);
 		srjson_DestroyDoc(&jdoc);
 		dlg_dmq_peer_fail(uri);
@@ -504,8 +505,8 @@ static int dlg_dmq_send_ping(str *uri)
 
 	cback.f = dlg_dmq_ping_resp_f;
 	cback.param = pp;
-	if(dlg_dmqb.send_message(dlg_dmq_peer, &jdoc.buf, node, &cback, 1,
-			   &dlg_dmq_content_type)
+	if(dlg_dmqb.send_message(
+			   dlg_dmq_peer, &jdoc.buf, node, &cback, 1, &dlg_dmq_content_type)
 			< 0) {
 		shm_free(pp);
 		jdoc.free_fn(jdoc.buf.s);
@@ -555,7 +556,8 @@ void dlg_dmq_peer_liveness_timer_exec(unsigned int ticks, void *param)
 
 	if(dlg_dmq_peer_liveness_enable == 0 || dlg_dmq_peer_liveness_interval <= 0)
 		return;
-	if(dlg_dmq_live_lock == NULL || dlg_dmq_peer == NULL || dmq_node_list == NULL)
+	if(dlg_dmq_live_lock == NULL || dlg_dmq_peer == NULL
+			|| dmq_node_list == NULL)
 		return;
 
 	lock_get(&dmq_node_list->lock);

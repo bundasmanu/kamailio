@@ -870,8 +870,8 @@ static int child_init(int rank)
 				&& dlg_dmq_peer_liveness_interval > 0
 				&& dlg_dmq_peer_liveness_failures > 0) {
 			if(fork_sync_timer(PROC_TIMER, "Dialog DMQ peer liveness",
-					   1 /*socks flag*/, dlg_dmq_peer_liveness_timer_exec,
-					   NULL, dlg_dmq_peer_liveness_interval /*sec*/)
+					   1 /*socks flag*/, dlg_dmq_peer_liveness_timer_exec, NULL,
+					   dlg_dmq_peer_liveness_interval /*sec*/)
 					< 0) {
 				LM_ERR("failed to start DMQ peer liveness timer\n");
 				return -1;
