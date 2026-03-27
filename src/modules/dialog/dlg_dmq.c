@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../../core/hashes.h"
 #include "../../core/mem/mem.h"
 #include "../../core/mem/shm_mem.h"
 #include "../../core/timer_proc.h"
@@ -156,23 +157,17 @@ int dlg_dmq_send(str *body, dmq_node_t *node)
 }
 
 
-static unsigned int dlg_dmq_uri_hash(str *u)
+static unsigned int dlg_uri_fail_bucket(str *u)
 {
-	unsigned int i, h = 5381;
-
-	for(i = 0; i < (unsigned int)u->len; i++)
-		h = ((h << 5) + h) + (unsigned char)u->s[i];
-	return h;
+	return core_hash_idx(get_hash1_raw(u->s, (int)u->len), DLG_DMQ_URI_FAIL_BUCKETS);
 }
-
-#define URI_FAIL_BUCKET(u) (dlg_dmq_uri_hash(u) % DLG_DMQ_URI_FAIL_BUCKETS)
 
 static dlg_uri_fail_t *dlg_uri_fail_find_nolock(str *u)
 {
 	dlg_uri_fail_t *f;
 	unsigned int b;
 
-	b = URI_FAIL_BUCKET(u);
+	b = dlg_uri_fail_bucket(u);
 	for(f = dlg_uri_fail_buckets[b]; f; f = f->next) {
 		if(f->ulen == (unsigned int)u->len
 				&& memcmp(f->ustr, u->s, u->len) == 0)
@@ -197,7 +192,7 @@ static dlg_uri_fail_t *dlg_uri_fail_get_or_create_nolock(str *u)
 	memset(f, 0, sz);
 	f->ulen = (unsigned int)u->len;
 	memcpy(f->ustr, u->s, u->len);
-	b = URI_FAIL_BUCKET(u);
+	b = dlg_uri_fail_bucket(u);
 	f->next = dlg_uri_fail_buckets[b];
 	dlg_uri_fail_buckets[b] = f;
 	return f;
@@ -208,7 +203,7 @@ static void dlg_uri_fail_unlink_nolock(str *u)
 	dlg_uri_fail_t *f, **pf;
 	unsigned int b;
 
-	b = URI_FAIL_BUCKET(u);
+	b = dlg_uri_fail_bucket(u);
 	pf = &dlg_uri_fail_buckets[b];
 	while((f = *pf) != NULL) {
 		if(f->ulen == (unsigned int)u->len
@@ -229,10 +224,7 @@ static int dlg_dmq_replica_owner_uri_match(dlg_dmq_replica_owner_t *r, str *o)
 
 static unsigned int dlg_dmq_replica_owner_bidx(dlg_iuid_t *iuid)
 {
-	unsigned int x;
-
-	x = iuid->h_entry ^ (iuid->h_id * 2654435761U);
-	return x & (DLG_DMQ_REPLICA_OWNER_BUCKETS - 1);
+	return core_hash_idx(iuid->h_entry ^ iuid->h_id, DLG_DMQ_REPLICA_OWNER_BUCKETS);
 }
 
 static dlg_dmq_replica_owner_t *dlg_dmq_replica_owner_find_nolock(
